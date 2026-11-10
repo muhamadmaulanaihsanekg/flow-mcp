@@ -102,7 +102,7 @@ async function readCredits(page: Page): Promise<number | undefined> {
   }
 }
 
-const settingsTrigger = (page: Page) => page.getByRole("button", { name: "Settings trigger" });
+const settingsTrigger = (page: Page) => page.locator('button[aria-label="Settings trigger"], .settings-trigger-button').first();
 
 // Every finished tile carries its media id in data-media-id; some thumbnails also have it in the URL, but Flow
 // serves signed /asb/ links with no uuid, so the attribute comes first and the URL is only a fallback.
@@ -340,6 +340,38 @@ async function pickRadio(page: Page, name: string | RegExp): Promise<void> {
   }
 }
 
+// Omni 1.2 Flash (2026-11) replaced the 4/6/8/10 s radios with a "Length" mat-slider in whole seconds. Its value is an
+// index, not seconds (0-12 meant 3-15 s on 2026-11-09), so it is driven by the seconds Flow itself shows in the
+// settings trigger ("Video · 360p · 6s"): Home, then ArrowRight until that reads the target. Omni 1.1 keeps its radios.
+async function pickDuration(page: Page, seconds: number): Promise<void> {
+  const pane = page.locator(".cdk-overlay-pane:has(.credit-cost-label)");
+  if (!(await pane.isVisible().catch(() => false))) await openSettings(page).catch(() => undefined);
+  const radio = page.getByRole("radio", { name: `${seconds}s`, exact: true }).first();
+  if (await radio.isVisible().catch(() => false)) return pickRadio(page, `${seconds}s`);
+  const slider = pane.locator('input[type="range"][aria-label="Length"], .duration-slider input[type="range"]').first();
+  if (await slider.isVisible().catch(() => false)) {
+    if (!Number.isInteger(seconds)) throw new Error(`Flow's length slider moves in whole seconds; ask for ${Math.round(seconds)}s instead of ${seconds}s.`);
+    const shown = async () => Number((await settingsTrigger(page).textContent().catch(() => ""))?.match(/(\d+)\s*s\b/)?.[1] ?? NaN);
+    const steps = Number(await slider.getAttribute("max")) - Number(await slider.getAttribute("min"));
+    await slider.focus();
+    await page.keyboard.press("Home");
+    await pause(page, 300);
+    const lowest = await shown();
+    for (let i = 0; i < steps && (await shown()) < seconds; i++) {
+      await page.keyboard.press("ArrowRight");
+      await pause(page, 150);
+    }
+    const got = await shown();
+    if (got !== seconds) throw new Error(`Flow's length slider runs ${lowest}-${lowest + steps}s; it stopped at ${got}s, not ${seconds}s.`);
+    await pause(page, 300);
+    return;
+  }
+  const controls = await pane.locator('[role="radio"], [role="slider"], [role="spinbutton"], input').evaluateAll((els) =>
+    els.map((e) => `${e.getAttribute("role") ?? e.tagName.toLowerCase()}:${(e.getAttribute("aria-label") ?? e.textContent ?? "").replace(/\s+/g, " ").trim()}`),
+  );
+  throw new Error(`Could not set a ${seconds}s duration. Settings controls seen: ${controls.join(" | ") || "(none)"}`);
+}
+
 // Image jobs use the newest Nano Banana unless another model is named (the user's call, 2026-10-13: "should always
 // default to latest"). The menu then held Nano Banana Pro, 2 Lite and 2.1 - the plain "Nano Banana 2" was gone, and
 // asking for it by name picked whichever came first. The newest is the highest version number that is not a Lite model,
@@ -404,7 +436,7 @@ async function applySettings(page: Page, job: Job): Promise<number> {
   const model = s.type === "image" && LEGACY_IMAGE_MODEL.test(s.model ?? "") ? LATEST_IMAGE_MODEL : s.model;
   if (model) await pickModel(page, model);
   if (s.type === "video" && s.resolution) await pickRadio(page, new RegExp(`^${s.resolution}`));
-  if (s.type === "video" && s.duration) await pickRadio(page, `${s.duration}s`);
+  if (s.type === "video" && s.duration) await pickDuration(page, s.duration);
   await pickRadio(page, `x${s.variants ?? 1}`);
   await pause(page, 600);
   // The quote is "<N> credits". Low balances add an "Add AI credits" banner link that the old /credits?$/ also matched.
@@ -577,7 +609,7 @@ function downloadsNow(): Set<string> {
 // Waits for a file to finish arriving in our download directory and returns it.
 async function waitForDownloadedFile(page: Page, before: Set<string>, timeoutMs: number): Promise<string> {
   const deadline = Date.now() + timeoutMs;
-  let stable: { path: string; size: number } | undefined;
+  const sizes = new Map<string, number>();
   while (Date.now() < deadline) {
     // Every quarter second: an image is there in well under a second, and a size that held still across two checks
     // still proves Chrome has finished writing it.
@@ -591,10 +623,11 @@ async function waitForDownloadedFile(page: Page, before: Set<string>, timeoutMs:
         candidates.push(join(dir, f));
       }
     }
+    // One remembered size per file: with two new files a single shared slot was reset on every pass and never matched.
     for (const path of candidates) {
       const size = statSync(path).size;
-      if (stable?.path === path && stable.size === size && size > 0) return path;
-      stable = { path, size };
+      if (size > 0 && sizes.get(path) === size) return path;
+      sizes.set(path, size);
     }
   }
   throw new Error("Flow started the download but no file arrived in either the tool's folder or ~/Downloads.");
@@ -699,13 +732,32 @@ async function downloadTile(page: Page, target: Locator | TileResolver, targetSt
         const items = await page.locator('[role="menuitem"]').evaluateAll((ms) => ms.map((m) => (m.textContent ?? "").replace(/\s+/g, " ").trim()));
         throw new Error(items.length ? `Flow's tile menu has no Download item. It offered: ${items.join(" | ")}` : "Flow's tile menu did not open.");
       }
-      await download.click({ timeout: 10_000 });
+      await download.hover().catch(() => {});
+      await download.click({ timeout: 10_000 }).catch(() => {});
+      await pause(page, 600);
       // Size submenu: "720p Original size" / "1K Original size", or the best upscale the plan allows.
       const original = page.getByRole("menuitem", { name: /original/i }).first();
-      if (await original.waitFor({ state: "visible", timeout: 3000 }).then(() => true, () => false)) {
+      if (await original.waitFor({ state: "visible", timeout: 5000 }).then(() => true, () => false)) {
         const upscaled = page.locator('[role="menuitem"]:not([aria-disabled="true"]):not([disabled])').filter({ hasText: /upscaled/i }).first();
         const wanted = quality === "upscaled" && (await upscaled.isVisible().catch(() => false)) ? upscaled : original;
-        await wanted.click();
+        const [dl] = await Promise.all([
+          page.waitForEvent("download", { timeout: 30_000 }).catch(() => null),
+          wanted.click(),
+        ]);
+        // useOwnDownloadDir hands the file to Chrome (allowAndName into DOWNLOAD_DIR), so Playwright's own artifact is
+        // never written and saveAs fails with ENOENT. That is not a failed download: fall through and pick the file up
+        // from DOWNLOAD_DIR with this attempt's `before`. Retrying instead would snapshot the arrived clip as old.
+        const saved = dl
+          ? await (async () => {
+              const target = `${targetStem}${extname(await dl.suggestedFilename()) || ".mp4"}`;
+              return dl.saveAs(target).then(() => target, () => undefined);
+            })()
+          : undefined;
+        if (saved) {
+          await page.keyboard.press("Escape");
+          await scrollToTop(page);
+          return [saved];
+        }
       }
       // Upscales are rendered on demand, so they can take minutes to appear.
       const file = await waitForDownloadedFile(page, before, quality === "upscaled" ? 600_000 : 180_000);
@@ -810,8 +862,21 @@ export async function runGeneration(job: Job): Promise<string[]> {
   const s = job.params;
 
   await ensureProjectGrid(page);
-  const agent = page.getByRole("button", { name: "Agent", exact: true });
-  if ((await agent.getAttribute("aria-pressed")) === "true") await agent.click();
+  const agentPanelClose = page.locator("flow-agent-panel").getByRole("button", { name: "Close", exact: true });
+  if (await agentPanelClose.isVisible().catch(() => false)) {
+    await agentPanelClose.click();
+    await pause(page, 500);
+  }
+  const agent = page.locator(".agent-mode-chip, button:has-text('Agent')").first();
+  if (await agent.isVisible().catch(() => false)) {
+    const isPressed =
+      (await agent.getAttribute("aria-pressed").catch(() => null)) === "true" ||
+      (await agent.evaluate((e) => e.classList.contains("agent-mode-chip-checked")).catch(() => false));
+    if (isPressed) {
+      await agent.click();
+      await pause(page, 500);
+    }
+  }
   const clear = page.getByRole("button", { name: "Clear prompt" });
   if (await clear.isVisible().catch(() => false)) await clear.click();
 
