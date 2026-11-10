@@ -5,11 +5,12 @@ import { basename, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { CACHE_DIR as CAPTIONS_DIR } from "./captions.js";
-import { HOME_DIR } from "./chrome.js";
+import { HOME_DIR, MAIN_LANE, inLane } from "./chrome.js";
 import { OUTPUT_ROOT, shapes, type Core } from "./core.js";
 
 export const PORT = Number(process.env.FLOW_MCP_PORT ?? 8787);
 export const TOKEN_FILE = join(HOME_DIR, "token");
+export const LANE_HEADER = "x-flow-lane";
 const UPLOAD_DIR = join(HOME_DIR, "uploads");
 const STUDIO_HTML = fileURLToPath(new URL("../studio/index.html", import.meta.url));
 const MAX_UPLOAD = 200 * 1024 * 1024;
@@ -97,7 +98,9 @@ export async function startServer(core: Core): Promise<ServerRole> {
         const raw = (await readBody(req, 1024 * 1024)).toString() || "{}";
         const shape = (shapes as Record<string, z.ZodRawShape>)[method];
         const args = shape ? z.object(shape).parse(JSON.parse(raw)) : undefined;
-        return json(res, 200, await (core[method] as (a: unknown) => Promise<unknown>)(args));
+        // Each MCP client process names its lane; Studio and older clients send none and share the main lane.
+        const lane = String(req.headers[LANE_HEADER] ?? "").trim() || MAIN_LANE;
+        return json(res, 200, await inLane(lane, () => (core[method] as (a: unknown) => Promise<unknown>)(args)));
       }
       json(res, 404, { error: "Not found." });
     } catch (err) {

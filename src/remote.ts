@@ -1,12 +1,16 @@
 import { readFileSync } from "node:fs";
+import { LANE_HEADER, PORT, TOKEN_FILE } from "./server.js";
 import { captionPreviewHere, captionSetupHere, captionsHere, narrateHere, presenterHere, transcribeHere, voicesHere, type Core } from "./core.js";
-import { PORT, TOKEN_FILE } from "./server.js";
+
+// This process's lane in the owner: its own Flow window, project and queue. FLOW_MCP_LANE pins a name (the same name
+// after a restart gets the same window back); otherwise the process id, freed when this process exits.
+const LANE = process.env.FLOW_MCP_LANE?.trim() || `pid:${process.pid}`;
 
 // Used when another flow-mcp process (Studio or a second Claude client) already owns the Flow tab and queue.
 async function call(method: string, args: unknown): Promise<unknown> {
   const res = await fetch(`http://127.0.0.1:${PORT}/api/${method}`, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-flow-token": readFileSync(TOKEN_FILE, "utf8").trim() },
+    headers: { "content-type": "application/json", "x-flow-token": readFileSync(TOKEN_FILE, "utf8").trim(), [LANE_HEADER]: LANE },
     body: JSON.stringify(args ?? {}),
   });
   const data = (await res.json()) as { error?: string };
@@ -27,6 +31,7 @@ export class RemoteCore implements Core {
   voices = voicesHere;
   narrate = narrateHere;
   new_project = (a: unknown) => call("new_project", a);
+  open_project = (a: unknown) => call("open_project", a);
   character = (a: unknown) => call("character", a);
   characters = () => call("characters", {});
   character_edit = (a: unknown) => call("character_edit", a);

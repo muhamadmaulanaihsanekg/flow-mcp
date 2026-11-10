@@ -2,7 +2,7 @@ import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, 
 import { homedir, tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import type { Locator, Page } from "playwright-core";
-import { HOME_DIR, getFlowPage, inEnglish } from "./chrome.js";
+import { HOME_DIR, currentLane, getFlowPage, inEnglish } from "./chrome.js";
 import type { Job } from "./queue.js";
 import { extractZip } from "./platform.js";
 
@@ -31,7 +31,7 @@ export async function getFlowState(detailed = false): Promise<FlowState> {
   const inProject = /\/project\//.test(url);
   const state: FlowState = { url, signedIn, inProject };
   if (!signedIn) state.hint = "Not signed in. Run `npm run login` and sign in to Google in the Flow Chrome window.";
-  else if (!inProject) state.hint = "Signed in, but no project is open. Open or create a project in the Flow Chrome window.";
+  else if (!inProject) state.hint = "Signed in, but this session's Flow window has no project open. Call flow_open_project with a project id or link, or flow_new_project.";
   else if (detailed) {
     state.plan = await page.getByRole("button", { name: "Account details" }).innerText().then((t) => t.trim().split("\n")[0], () => undefined);
     state.credits_remaining = await readCredits(page).catch(() => undefined);
@@ -582,6 +582,16 @@ function tileByIdOrTitle(page: Page, id: string, title?: string): TileResolver {
 }
 
 const DOWNLOAD_DIR = join(HOME_DIR, "downloads");
+
+// Chrome has ONE download folder for every tab, and a download is recognised as "the file that was not there before".
+// With several lanes downloading at the same moment each could take the other's file, so downloads run one at a time
+// across all lanes. Generations still run side by side; only the few seconds of saving a file wait their turn.
+let downloadTurn: Promise<unknown> = Promise.resolve();
+function oneDownloadAtATime<T>(work: () => Promise<T>): Promise<T> {
+  const mine = downloadTurn.then(work, work);
+  downloadTurn = mine.catch(() => undefined);
+  return mine;
+}
 let downloadsReady = false;
 
 // Playwright keeps a download in a per-connection temp file it can delete from under us; pointing Chrome itself at a
@@ -711,7 +721,10 @@ async function renameTile(page: Page, tile: Locator, title: string): Promise<boo
   }
 }
 
-async function downloadTile(page: Page, target: Locator | TileResolver, targetStem: string, quality: DownloadQuality): Promise<string[]> {
+function downloadTile(page: Page, target: Locator | TileResolver, targetStem: string, quality: DownloadQuality): Promise<string[]> {
+  return oneDownloadAtATime(() => downloadTileNow(page, target, targetStem, quality));
+}
+async function downloadTileNow(page: Page, target: Locator | TileResolver, targetStem: string, quality: DownloadQuality): Promise<string[]> {
   await useOwnDownloadDir(page);
   const resolve: TileResolver = typeof target === "function" ? target : async () => target;
   let lastError: unknown;
@@ -1024,7 +1037,10 @@ async function leaveCharacterEditor(page: Page): Promise<void> {
 // moves over the picture - the same rule as grid tiles - so a plain click lands on the image and times out. That, plus
 // Playwright's download event, is why an edit that worked never reached disk (2026-10-02). Point at the picture, then
 // download through the same watched folders as every other file.
-async function savePortrait(page: Page, name: string): Promise<string> {
+function savePortrait(page: Page, name: string): Promise<string> {
+  return oneDownloadAtATime(() => savePortraitNow(page, name));
+}
+async function savePortraitNow(page: Page, name: string): Promise<string> {
   await useOwnDownloadDir(page);
   const dir = join(process.env.FLOW_MCP_OUTPUT ?? join(homedir(), "flow-mcp-out"), "_cast");
   mkdirSync(dir, { recursive: true });
@@ -1205,11 +1221,15 @@ async function downloadScene(page: Page, scene: FlowAsset, targetStem: string): 
   else await tile.click();
   await page.waitForURL(/\/scene\//, { timeout: 30_000 });
   await pause(page, 3000);
-  const before = downloadsNow();
-  await page.getByRole("button", { name: "Download scene", exact: true }).click();
-  const file = await waitForDownloadedFile(page, before, 600_000);
-  const target = `${targetStem}${extensionOf(file)}`;
-  renameSync(file, target);
+  const target = await oneDownloadAtATime(async () => {
+    await useOwnDownloadDir(page);
+    const before = downloadsNow();
+    await page.getByRole("button", { name: "Download scene", exact: true }).click();
+    const file = await waitForDownloadedFile(page, before, 600_000);
+    const saved = `${targetStem}${extensionOf(file)}`;
+    renameSync(file, saved);
+    return saved;
+  });
   await page.getByRole("button", { name: "Back button to go to previous page" }).click().catch(() => {});
   await pause(page, 2000);
   await ensureProjectGrid(page).catch(() => {});
@@ -1925,5 +1945,29 @@ export async function createProject(title?: string): Promise<{ id: string; url: 
     await page.waitForTimeout(1200);
   }
   const shown = (await name.inputValue().catch(() => "")) || title || "";
+  currentLane().projectUrl = `https://flow.google.com/project/${id}`;
   return { id, url: `https://flow.google.com/project/${id}`, title: shown };
+}
+
+// Opens an existing project in this lane's window: by id, by link, or by the name Flow shows on its home page.
+export async function openProject(project: string): Promise<{ id: string; url: string; title: string }> {
+  const page = await getFlowPage();
+  let id = project.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0];
+  if (!id) {
+    await page.goto(inEnglish("https://flow.google.com/"), { waitUntil: "domcontentloaded" });
+    await pause(page, 3000);
+    const card = page.locator(`a[href*="/project/"]`).filter({ hasText: project }).first();
+    const href = await card.getAttribute("href", { timeout: 15_000 }).catch(() => null);
+    id = href?.match(/[0-9a-f-]{36}/)?.[0];
+    if (!id) throw new Error(`No Flow project named "${project}" on Flow's home page. Pass the project id or its link instead.`);
+  }
+  const url = `https://flow.google.com/project/${id}`;
+  await page.goto(inEnglish(url), { waitUntil: "domcontentloaded" });
+  await page.waitForURL(/\/project\/[0-9a-f-]{36}/, { timeout: 30_000 }).catch(() => {
+    throw new Error(`Flow did not open project ${id}. Check the id, and that this Google account can see it.`);
+  });
+  currentLane().projectUrl = url;
+  const name = page.getByRole("textbox", { name: "Editable text" }).first();
+  await name.waitFor({ state: "visible", timeout: 15_000 }).catch(() => undefined);
+  return { id, url, title: await name.inputValue().catch(() => "") };
 }

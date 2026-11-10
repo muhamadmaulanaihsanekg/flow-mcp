@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -59,6 +60,11 @@ async function launchChrome(): Promise<void> {
       `--remote-debugging-port=${CDP_PORT}`,
       "--no-first-run",
       "--no-default-browser-check",
+      // Several lanes drive Flow at once, each in its own window, and most of them sit behind another window. Without
+      // these Chrome slows hidden or covered windows down and Flow's menus and uploads stall there.
+      "--disable-background-timer-throttling",
+      "--disable-renderer-backgrounding",
+      "--disable-backgrounding-occluded-windows",
       inEnglish(FLOW_URL),
     ],
     { detached: true, stdio: "ignore" },
@@ -78,18 +84,105 @@ export async function getBrowser(): Promise<Browser> {
   return browser;
 }
 
-export async function getFlowPage(): Promise<Page> {
+// A lane is one Flow tab with its own project and its own queue. Every MCP process (one per agent session) gets its own
+// lane, so two sessions no longer fight over one tab: before lanes, one session opening a project moved every other
+// session's queued work into it (2026-11-10, EP020 jobs ran in another session's project or never ran at all).
+// The lane of the current call travels with it through AsyncLocalStorage, so every getFlowPage() below picks the
+// right tab without each Flow helper being told which one.
+export interface Lane {
+  key: string;
+  page?: Page;
+  // The project this lane last had open. A tab that was closed comes back here.
+  projectUrl?: string;
+}
+export const MAIN_LANE = "main";
+const lanes = new Map<string, Lane>();
+const laneStore = new AsyncLocalStorage<Lane>();
+
+export const laneOf = (key: string): Lane => {
+  let lane = lanes.get(key);
+  if (!lane) lanes.set(key, (lane = { key }));
+  return lane;
+};
+export const currentLane = (): Lane => laneStore.getStore() ?? laneOf(MAIN_LANE);
+export const inLane = <T>(key: string, work: () => T): T => laneStore.run(laneOf(key), work);
+export const allLanes = (): Lane[] => [...lanes.values()];
+// Set by the core: whether a lane still has queued or running jobs (its tab must not be handed to another lane).
+let laneBusy: (key: string) => boolean = () => false;
+export const setLaneBusy = (fn: (key: string) => boolean): void => {
+  laneBusy = fn;
+};
+
+// "pid:<n>" lanes belong to an MCP client process; once that process is gone its tab may be reused.
+const laneAlive = (key: string): boolean => {
+  const pid = Number(key.match(/^pid:(\d+)$/)?.[1]);
+  if (!pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const projectOf = (url: string) => url.match(/^https:\/\/[^/]+\/project\/[0-9a-f-]{36}/)?.[0];
+
+// Chrome slows down a tab that is not in front. Telling the page it is focused and active keeps Flow's timers,
+// animations and uploads running in every lane's window.
+async function keepAwake(page: Page): Promise<void> {
+  const cdp = await page.context().newCDPSession(page).catch(() => undefined);
+  if (!cdp) return;
+  await cdp.send("Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
+  await cdp.send("Page.setWebLifecycleState", { state: "active" }).catch(() => {});
+}
+
+// A new top-level window rather than a tab: a background tab is hidden, and Flow does not finish its work there.
+async function openLaneWindow(url: string): Promise<Page> {
   const b = await getBrowser();
   const context = b.contexts()[0];
   if (!context) throw new Error("Chrome has no browser context; restart the Flow Chrome window.");
-  const existing = context.pages().find((p) => FLOW_HOSTS.test(p.url()));
-  if (existing) {
-    await ensureEnglish(existing);
-    return existing;
+  const cdp = await b.newBrowserCDPSession();
+  const arrived = context.waitForEvent("page", { timeout: 20_000 });
+  await cdp.send("Target.createTarget", { url, newWindow: true });
+  const page = await arrived;
+  await page.waitForLoadState("domcontentloaded").catch(() => {});
+  return page;
+}
+
+export async function getFlowPage(): Promise<Page> {
+  const lane = currentLane();
+  if (lane.page && !lane.page.isClosed()) {
+    await ensureEnglish(lane.page);
+    const at = projectOf(lane.page.url());
+    if (at) lane.projectUrl = at;
+    return lane.page;
   }
-  const page = await context.newPage();
-  await page.goto(inEnglish(FLOW_URL), { waitUntil: "domcontentloaded" });
+  lane.page = undefined;
+  const b = await getBrowser();
+  const context = b.contexts()[0];
+  if (!context) throw new Error("Chrome has no browser context; restart the Flow Chrome window.");
+  // Lanes whose MCP process has exited and that have nothing left to run: close their window so they do not pile up.
+  for (const other of [...lanes.values()]) {
+    if (other === lane || laneAlive(other.key) || laneBusy(other.key)) continue;
+    await other.page?.close().catch(() => {});
+    lanes.delete(other.key);
+  }
+  const taken = new Set(allLanes().map((l) => l.page).filter(Boolean));
+  const free = context.pages().filter((p) => FLOW_HOSTS.test(p.url()) && !taken.has(p));
+  // The main lane takes the Flow tab the user already has (as before lanes). Other lanes only take a free tab that
+  // already shows their own project; otherwise they get a window of their own, so they never take the user's tab.
+  const page =
+    (lane.projectUrl && free.find((p) => projectOf(p.url()) === lane.projectUrl)) ||
+    (lane.key === MAIN_LANE ? free[0] : undefined) ||
+    (await openLaneWindow(inEnglish(lane.projectUrl ?? FLOW_URL)));
+  lane.page = page;
+  await keepAwake(page);
+  if (lane.projectUrl && projectOf(page.url()) !== lane.projectUrl && !/accounts\.google\.com/.test(page.url())) {
+    await page.goto(inEnglish(lane.projectUrl), { waitUntil: "domcontentloaded" });
+  }
   await ensureEnglish(page);
+  const at = projectOf(page.url());
+  if (at) lane.projectUrl = at;
   return page;
 }
 

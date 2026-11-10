@@ -8,7 +8,8 @@ import { KOKORO_DEFAULT_VOICE, KOKORO_MB, KOKORO_VOICES, kokoroReady, speakWithK
 import { extractFirstFrame, extractFrameAt, extractLastFrame } from "./chain.js";
 import { burnCaptions, captionedName, captionSetup, previewCaptions, transcribe } from "./captions.js";
 import { presenter } from "./presenter.js";
-import { characterLook, createCharacter, createProject, downloadAsset, trashAsset, editCharacter, getFlowState, listAssets, forgetCharacter, listCharacters, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
+import { allLanes, currentLane, inLane, setLaneBusy } from "./chrome.js";
+import { characterLook, createCharacter, createProject, openProject, downloadAsset, trashAsset, editCharacter, getFlowState, listAssets, forgetCharacter, listCharacters, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
 import { JobQueue, type Job } from "./queue.js";
 import { BIN, COMPUTER, moveToBin } from "./platform.js";
 import { TECHNIQUES, techniqueById } from "./techniques.js";
@@ -382,6 +383,9 @@ export const shapes = {
         "The character's whole description AFTER the change, e.g. the old one with 'navy coat' swapped for 'red coat'. Scenes quote it word for word to hold the design, so a stale colour in it fights the new portrait. Without it, the change is added to the end of the old description.",
       ),
   },
+  open_project: {
+    project: z.string().min(1).describe("Flow project id (uuid), its link (https://flow.google.com/project/...), or its name as shown on Flow's home page."),
+  },
   new_project: {
     title: z.string().max(80).optional().describe("Name for the new project, e.g. 'Desk lamp UGC ad'. Default: Flow's own date-and-time name."),
   },
@@ -440,6 +444,7 @@ export interface Core {
   voices(): Promise<unknown>;
   narrate(a: Args<"narrate">): Promise<unknown>;
   new_project(a: Args<"new_project">): Promise<unknown>;
+  open_project(a: Args<"open_project">): Promise<unknown>;
   character(a: Args<"character">): Promise<unknown>;
   characters(): Promise<unknown>;
   character_edit(a: Args<"character_edit">): Promise<unknown>;
@@ -476,10 +481,30 @@ export const VOICES = [
   { name: "Iapetus", description: "male, clear, mid-low pitch" },
 ];
 
-const BUSY = "A generation is running in the Flow tab. Wait for it to finish (flow_wait), then retry.";
+const BUSY = "A generation is running in this session's Flow window. Wait for it to finish (flow_wait), then retry.";
 
 export class LocalCore implements Core {
-  private queue: JobQueue = new JobQueue(async (job) => {
+  // One queue per lane (= one Flow window per MCP session). Lanes run side by side; inside a lane jobs still run one at
+  // a time with the usual pause, because they share that window.
+  private queues = new Map<string, JobQueue>();
+
+  constructor() {
+    setLaneBusy((key) => this.queues.get(key)?.list().some((j) => j.status === "queued" || j.status === "running") ?? false);
+  }
+
+  // The current call's lane queue. Jobs always run inside their own lane, so the runner's lookups land here too.
+  private get queue(): JobQueue {
+    const key = currentLane().key;
+    let q = this.queues.get(key);
+    if (!q) this.queues.set(key, (q = new JobQueue((job) => inLane(key, () => this.runJob(job)))));
+    return q;
+  }
+
+  private allJobs(): Job[] {
+    return [...this.queues.values()].flatMap((q) => q.list());
+  }
+
+  private runJob = async (job: Job): Promise<string[]> => {
     const { chain_from, reference_from } = job.params;
     if (reference_from) {
       const still = this.queue.get(reference_from)?.files.find((f) => /\.(jpe?g|png|webp)$/i.test(f));
@@ -504,11 +529,22 @@ export class LocalCore implements Core {
     if (job.params.agent_scenes) return runAgentBatch(job);
     if (job.params.edit_asset) return runEdit(job);
     return runGeneration(job);
-  });
+  };
 
   async status({ detailed }: Args<"status">) {
     const flow = await getFlowState(detailed && !this.queue.busy);
-    return { flow, pacing: this.queue.pausedReason, output_root: OUTPUT_ROOT, jobs: this.queue.list().map(jobView) };
+    const lanes = allLanes().map((l) => {
+      const jobs = this.queues.get(l.key)?.list() ?? [];
+      return {
+        lane: l.key,
+        this_session: l.key === currentLane().key,
+        project: l.projectUrl,
+        window_open: Boolean(l.page && !l.page.isClosed()),
+        queued: jobs.filter((j) => j.status === "queued").length,
+        running: jobs.filter((j) => j.status === "running").length,
+      };
+    });
+    return { flow, lane: currentLane().key, lanes, pacing: this.queue.pausedReason, output_root: OUTPUT_ROOT, jobs: this.queue.list().map(jobView) };
   }
 
   async generate({ project, scenes }: Args<"generate">) {
@@ -524,7 +560,7 @@ export class LocalCore implements Core {
     const output_dir = projectDir(project);
     // Continue numbering after whatever is already on disk or queued, so reruns never overwrite earlier scenes.
     const onDisk = existsSync(output_dir) ? readdirSync(output_dir).map((f) => Number(f.match(/^scene-(\d+)/)?.[1] ?? 0)) : [];
-    const queued = this.queue.list().filter((j) => j.params.output_dir === output_dir).map((j) => Number(j.params.file_stem.match(/\d+/)?.[0] ?? 0));
+    const queued = this.allJobs().filter((j) => j.params.output_dir === output_dir).map((j) => Number(j.params.file_stem.match(/\d+/)?.[0] ?? 0));
     const offset = Math.max(0, ...onDisk, ...queued);
     const jobs: Job[] = [];
     for (const [i, { chain_previous, reference_previous, technique, outfit, on_screen_text, ...scene }] of scenes.entries()) {
@@ -678,7 +714,7 @@ export class LocalCore implements Core {
 
   private nextStem(output_dir: string, prefix: string): string {
     const onDisk = existsSync(output_dir) ? readdirSync(output_dir).map((f) => Number(f.match(new RegExp(`^${prefix}-(\\d+)`))?.[1] ?? 0)) : [];
-    const queued = this.queue.list().filter((j) => j.params.output_dir === output_dir && j.params.file_stem.startsWith(prefix)).map((j) => Number(j.params.file_stem.match(/\d+/)?.[0] ?? 0));
+    const queued = this.allJobs().filter((j) => j.params.output_dir === output_dir && j.params.file_stem.startsWith(prefix)).map((j) => Number(j.params.file_stem.match(/\d+/)?.[0] ?? 0));
     return `${prefix}-${String(Math.max(0, ...onDisk, ...queued) + 1).padStart(2, "0")}`;
   }
 
@@ -768,7 +804,13 @@ export class LocalCore implements Core {
   async new_project({ title }: Args<"new_project">) {
     if (this.queue.busy) throw new Error(BUSY);
     const made = await createProject(title);
-    return { ...made, note: "The Flow window now has this empty project open; every generation goes into it. Characters belong to a project, so make them again here." };
+    return { ...made, lane: currentLane().key, note: "This session's Flow window now has this empty project open; this session's generations go into it. Other sessions keep their own windows and projects. Characters belong to a project, so make them again here." };
+  }
+
+  async open_project({ project }: Args<"open_project">) {
+    if (this.queue.busy) throw new Error(BUSY);
+    const opened = await openProject(project);
+    return { ...opened, lane: currentLane().key, note: "This session's Flow window now shows this project; this session's generations go into it." };
   }
 
   async character(a: Args<"character">) {

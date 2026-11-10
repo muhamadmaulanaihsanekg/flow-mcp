@@ -234,7 +234,13 @@ key → Save key**. It's checked with Google before it's saved, and stored only 
 
 ## Behaviour and settings
 
-- One generation at a time, with a random 25–70 second pause between them. The page carries an
+- Several agent sessions can use Flow at the same time. Each session gets its own **lane**: its own Chrome
+  window, its own Flow project and its own queue, so one session opening a project never moves another
+  session's work. A new session starts with no project: call `flow_open_project` (id, link or name) or
+  `flow_new_project`. `flow_status` lists every lane. Set `FLOW_MCP_LANE` to give a session a fixed lane
+  name (it gets the same window back after a restart); otherwise the lane ends when its process exits and
+  its window is closed. Downloads still happen one at a time across lanes (Chrome has one download folder).
+- Inside one lane: one generation at a time, with a random 25–70 second pause between them. The page carries an
   invisible reCAPTCHA; this drives the real interface at human pace and does nothing to evade it.
 - Before each generation the server reads Flow's own credit quote and skips the scene if it exceeds
   `max_credits` (default 25).
@@ -243,7 +249,7 @@ key → Save key**. It's checked with Google before it's saved, and stored only 
   language setting is never changed, and prompts can be written in any language.
 - Environment variables: `GEMINI_API_KEY`, `FLOW_MCP_PORT` (8787), `FLOW_MCP_OUTPUT`,
   `FLOW_MCP_HOME`, `FLOW_MCP_CDP_PORT` (9333), `FLOW_MCP_CHROME`, `FLOW_MCP_PAUSE_MIN_S`,
-  `FLOW_MCP_PAUSE_MAX_S`.
+  `FLOW_MCP_PAUSE_MAX_S`, `FLOW_MCP_LANE`.
 
 ## If something goes wrong
 

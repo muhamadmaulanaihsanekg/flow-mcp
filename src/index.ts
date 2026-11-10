@@ -241,11 +241,22 @@ server.registerTool(
   "flow_new_project",
   {
     title: "Start a new Flow project",
-    description: "Create a new, empty Google Flow project and open it in the Flow window, optionally with a name - for starting a film or ad from scratch. Free. Characters belong to a project, so make them again in the new one.",
+    description: "Create a new, empty Google Flow project and open it in this session's own Flow window, optionally with a name - for starting a film or ad from scratch. Free. Characters belong to a project, so make them again in the new one.",
     inputSchema: shapes.new_project,
     annotations: { openWorldHint: true },
   },
   (args) => reply(patient("flow_new_project", core.new_project(args))),
+);
+
+server.registerTool(
+  "flow_open_project",
+  {
+    title: "Open an existing Flow project",
+    description: "Open an existing Google Flow project (id, link or name) in THIS session's own Flow window. Every agent session has its own window, project and queue, so several sessions can generate at the same time without moving each other's work. Free.",
+    inputSchema: shapes.open_project,
+    annotations: { openWorldHint: true },
+  },
+  (args) => reply(patient("flow_open_project", core.open_project(args))),
 );
 
 server.registerTool(
