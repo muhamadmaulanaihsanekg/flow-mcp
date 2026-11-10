@@ -1,5 +1,7 @@
 # flow-mcp
 
+> **Second PC / keeping PCs the same:** this fork uses branch `maul-fixes`. To pull, apply or push changes, follow [SYNC.md](SYNC.md) step by step (one script: `scripts/sync-maul.mjs`).
+
 Drive **Google Flow** (flow.google.com) from Claude, Codex or any other MCP app, or from a local control
 panel, using Flow's own credits (free with any Google account: 50 a day), not the pay-per-use video API.
 

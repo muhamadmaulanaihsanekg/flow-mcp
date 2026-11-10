@@ -1,5 +1,7 @@
 # flow-mcp
 
+> **Second PC / keeping PCs the same:** this fork uses branch `maul-fixes`. To pull, apply or push changes, follow [SYNC.md](SYNC.md) step by step (one script: `scripts/sync-maul.mjs`).
+
 Local MCP server (stdio, TypeScript) that drives Google Flow in a dedicated Chrome profile over CDP
 (`playwright-core`, `connectOverCDP` on port 9333). No extension. Goal: feature parity with
 OmniFlow (lingoflow.pro/omniflow), using subscription credits instead of the API.
